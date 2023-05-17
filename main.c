@@ -3,13 +3,11 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <dirent.h>
-#include <time.h>
-#include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <ctype.h>
 #include <signal.h>
+#include <sys/wait.h>
 
 // Store the command in a struct
 struct command {
@@ -19,6 +17,12 @@ struct command {
     char *input;
     char *output;
     int ampersand; // 0 if no ampersand, 1 if ampersand
+};
+
+// Store the latest process in a struct
+struct process {
+    int status;
+    int exited;
 };
 
 void handleSIGINT(int sigum) {
@@ -31,21 +35,21 @@ struct command *processLine(char *currLine) {
         return NULL;
     }
 
-    struct command *currCommand = malloc(sizeof(struct command));
+    struct command *curr = malloc(sizeof(struct command));
     char *saveptr;
 
     // Initialize the command
-    currCommand->name = NULL;
-    currCommand->args = NULL;
-    currCommand->numArgs = 0;
-    currCommand->input = NULL;
-    currCommand->output = NULL;
-    currCommand->ampersand = 0;
+    curr->name = NULL;
+    curr->args = NULL;
+    curr->numArgs = 0;
+    curr->input = NULL;
+    curr->output = NULL;
+    curr->ampersand = 0;
 
     // Get the command name
     char *token = strtok_r(currLine, " ", &saveptr);
-    currCommand->name = calloc(strlen(token) + 1, sizeof(char));
-    strcpy(currCommand->name, token);
+    curr->name = calloc(strlen(token) + 1, sizeof(char));
+    strcpy(curr->name, token);
 
     // Get the arguments
     int indexArg = 0;
@@ -58,10 +62,10 @@ struct command *processLine(char *currLine) {
         strcpy(arg, token);
 
         // Add the argument to the array of arguments
-        currCommand->args = realloc(currCommand->args, (indexArg + 1) * sizeof(char *));
-        currCommand->args[indexArg] = arg;
+        curr->args = realloc(curr->args, (indexArg + 1) * sizeof(char *));
+        curr->args[indexArg] = arg;
         indexArg++;
-        currCommand->numArgs++;
+        curr->numArgs++;
 
         // Get the next argument
         token = strtok_r(NULL, " ", &saveptr);
@@ -71,16 +75,16 @@ struct command *processLine(char *currLine) {
     if (token != NULL && strcmp(token, "<") == 0) {
         // Get the part after the space and store it as the input
         token = strtok_r(NULL, " ", &saveptr);
-        currCommand->input = calloc(strlen(token) + 1, sizeof(char));
-        strcpy(currCommand->input, token);
+        curr->input = calloc(strlen(token) + 1, sizeof(char));
+        strcpy(curr->input, token);
     } else if (token != NULL && strcmp(token, ">") == 0) {
         // Get the part after the space and store it as the output
         token = strtok_r(NULL, " ", &saveptr);
-        currCommand->output = calloc(strlen(token) + 1, sizeof(char));
-        strcpy(currCommand->output, token);
+        curr->output = calloc(strlen(token) + 1, sizeof(char));
+        strcpy(curr->output, token);
     } else if (token != NULL && strcmp(token, "&") == 0) {
-        currCommand->ampersand = 1; // Set the ampersand flag to true
-        return currCommand;         // Return the new command
+        curr->ampersand = 1; // Set the ampersand flag to true
+        return curr;         // Return the new command
     }
 
     token = strtok_r(NULL, " ", &saveptr);
@@ -89,26 +93,26 @@ struct command *processLine(char *currLine) {
     if (token != NULL && strcmp(token, ">") == 0) {
         // Get the part after the space and store it as the output
         token = strtok_r(NULL, " ", &saveptr);
-        currCommand->output = calloc(strlen(token) + 1, sizeof(char));
-        strcpy(currCommand->output, token);
+        curr->output = calloc(strlen(token) + 1, sizeof(char));
+        strcpy(curr->output, token);
     } else if (token != NULL && strcmp(token, "<") == 0) {
         // Get the part after the space and store it as the input
         token = strtok_r(NULL, " ", &saveptr);
-        currCommand->input = calloc(strlen(token) + 1, sizeof(char));
-        strcpy(currCommand->input, token);
+        curr->input = calloc(strlen(token) + 1, sizeof(char));
+        strcpy(curr->input, token);
     } else if (token != NULL && strcmp(token, "&") == 0) {
-        currCommand->ampersand = 1; // Set the ampersand flag to true
-        return currCommand;         // Return the new command
+        curr->ampersand = 1; // Set the ampersand flag to true
+        return curr;         // Return the new command
     }
 
     token = strtok_r(NULL, " ", &saveptr);
 
     // If the next argument is an ampersand, then process it
     if (token != NULL && strcmp(token, "&") == 0) {
-        currCommand->ampersand = 1; // Set the ampersand flag to true
+        curr->ampersand = 1; // Set the ampersand flag to true
     }
 
-    return currCommand; // Return the new command
+    return curr; // Return the new command
 }
 
 // Counts the number of expansions in the input
@@ -132,24 +136,24 @@ char *variableExpansion(char *input, int expansions, int pid) {
     int pidSize = snprintf(NULL, 0, "%d", pid);
 
     int newLength = length + (pidSize - 2) * expansions;
-    char *newOutput = calloc(newLength + 1, sizeof(char));
+    char *output = calloc(newLength + 1, sizeof(char));
 
     int j = 0;
     for (int i = 0; i < length; i++) {
         if (input[i] == '$' && input[i + 1] == '$') {
             // Expand the variable
-            sprintf(newOutput + j, "%d", pid);
+            sprintf(output + j, "%d", pid);
             j += pidSize;
             i++; // Skip the second '$'
         } else {
             // Copy the character
-            newOutput[j] = input[i];
+            output[j] = input[i];
             j++;
         }
     }
 
-    newOutput[j] = '\0';
-    return newOutput;
+    output[j] = '\0';
+    return output;
 }
 
 // Frees unneeded memory and sets the input to the output
@@ -161,171 +165,183 @@ void freeAndSet(char **input, char *output) {
 }
 
 // Expands variables in the command
-struct command *expandVariables(struct command *currCommand, int pid) {
-    struct command *expandCommand = currCommand;
+struct command *expandVariables(struct command *curr, int pid) {
+    struct command *expand = curr;
 
     // Expand the command name
-
-    // Count the number of variable expansions and then expand
-    int expansions = countExpansions(expandCommand->name);
-    char *newOutput = variableExpansion(expandCommand->name, expansions, pid);
-    freeAndSet(&(expandCommand->name), newOutput);
+    int expansions = countExpansions(expand->name);
+    char *output = variableExpansion(expand->name, expansions, pid);
+    freeAndSet(&(expand->name), output);
 
     // Expand the arguments
-
-    for (int i = 0; i < expandCommand->numArgs; i++) {
-        // Count the number of variable expansions and then expand
-        expansions = countExpansions(expandCommand->args[i]);
-        newOutput = variableExpansion(expandCommand->args[i], expansions, pid);
-        freeAndSet(&(expandCommand->args[i]), newOutput);
+    for (int i = 0; i < expand->numArgs; i++) {
+        expansions = countExpansions(expand->args[i]);
+        output = variableExpansion(expand->args[i], expansions, pid);
+        freeAndSet(&(expand->args[i]), output);
     }
 
     // Expand the input
-
-    if (expandCommand->input != NULL) {
-        // Count the number of variable expansions and then expand
-        expansions = countExpansions(expandCommand->input);
-        newOutput = variableExpansion(expandCommand->input, expansions, pid);
-        freeAndSet(&(expandCommand->input), newOutput);
+    if (expand->input != NULL) {
+        expansions = countExpansions(expand->input);
+        output = variableExpansion(expand->input, expansions, pid);
+        freeAndSet(&(expand->input), output);
     }
 
     // Expand the output
-
-    if (expandCommand->output != NULL) {
-        // Count the number of variable expansions and then expand
-        expansions = countExpansions(expandCommand->output);
-        newOutput = variableExpansion(expandCommand->output, expansions, pid);
-        freeAndSet(&(expandCommand->output), newOutput);
+    if (expand->output != NULL) {
+        expansions = countExpansions(expand->output);
+        output = variableExpansion(expand->output, expansions, pid);
+        freeAndSet(&(expand->output), output);
     }
 
-    return expandCommand;
+    return expand;
 }
 
 // Function to execute exit
-void executeExit(struct runningProcess *list) {
-    // killAll(list);
+void executeExit() {
     exit(EXIT_SUCCESS);
 }
 
 // Function to execute CD
-// Note: This function ignores input redirection, output redirection, foreground/background, and additional arguements
-int executeCD(struct command *currCommand) {
+void executeCD(struct command *curr) {
     int result = 0;
     char currentDir[2048]; // Stores the current directory
 
     // If the user entered no arguments, then go to the home directory
-    if (currCommand->numArgs == 0) {
+    if (curr->numArgs == 0) {
         result = chdir(getenv("HOME"));
         if (result != 0) {
             perror("Failed to change directory");
             fflush(stdout);
-            return 1;
+            return;
         }
     // If the user entered one argument, then go to that directory
     } else {
         // If the user entered a relative path, then add the current directory
-        if (currCommand->args[0][0] != '/') {
+        if (curr->args[0][0] != '/') {
             if (getcwd(currentDir, sizeof(currentDir)) != NULL) {
                 strcat(currentDir, "/");
                 // Implement if there is a slash at the end, remove it
-                strcat(currentDir, currCommand->args[0]);
+                strcat(currentDir, curr->args[0]);
                 result = chdir(currentDir);
                 if (result != 0) {
                     perror("Failed to change directory");
                     fflush(stdout);
-                    return 1;
+                    return;
                 }
             } else {
                 perror("Failed to get current directory");
                 fflush(stdout);
-                return 1;
+                return;
             }
         } else {
-            result = chdir(currCommand->args[0]);
+            result = chdir(curr->args[0]);
             if (result != 0) {
                 perror("Failed to change directory");
                 fflush(stdout);
-                return 1;
+                return;
             }
         }
     }
-
-    return 0;
-}
-
-// Function to execute status
-int executeStatus() {
-
-    return 0;
 }
 
 // Function to redirect input
 int redirectInput(char *input) {
+    // Open the input file
     int fd = open(input, O_RDONLY);
 
+    // Check if the open failed
     if (fd == -1) {
         perror("Failed to open file");
         fflush(stdout);
         return -1;
     }
 
+    // Redirect the input and check if it failed
     if (dup2(fd, 0) == -1) {
         perror("Failed to redirect input");
         fflush(stdout);
         return -1;
     }
 
+    // Return its status
     return fd;
 }
 
 // Function to redirect output
-int redirectOutput(char *output)
-{
+int redirectOutput(char *output) {
+    // Open the output file
     int fd = open(output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
+    // Check if the open failed
     if (fd == -1) {
         perror("Failed to open file");
         fflush(stdout);
         return -1;
     }
 
+    // Redirect the output and check if it failed
     if (dup2(fd, 1) == -1) {
         perror("Failed to redirect output");
         fflush(stdout);
         return -1;
     }
 
+    // Return its status
     return fd;
 }
 
+// Function to set status
+void printStatus(struct process *proc) {
+    if(proc == NULL) {
+        printf("exit value 0\n");
+        return;
+    }
+
+    if(proc->exited == 1) {
+        printf("exit value %d\n", proc->status);
+    } else {
+        printf("terminated by signal %d\n", proc->status);
+    }
+}
+
 // Function to execute a command
-int executeCommand(struct command *curr)
-{
+struct process *executeCommand(struct command *curr) {
     // Fork a new process
-    int spawnPid = fork();
+    int childStatus;
+    pid_t spawnPid = fork();
+
+    struct process *proc = malloc(sizeof(struct process));
 
     // If the fork failed, then print an error
     if (spawnPid == -1) {
         perror("Failed to fork");
         fflush(stdin);
-        return 1;
+        proc->status = 1;
+        proc->exited = 1;
+        return proc;
     } else if (spawnPid == 0) {
         // Child
         // Construct the argument array
-        char *argv[curr->numArgs + 2]; // +2 for command name and NULL terminator
+        char *argv[curr->numArgs + 2];
         argv[0] = curr->name;
+
         for (int i = 0; i < curr->numArgs; i++) {
             argv[i + 1] = curr->args[i];
         }
+
         argv[curr->numArgs + 1] = NULL;
 
         // Redirect the input
         if (curr->input != NULL) {
             int inputFd = redirectInput(curr->input);
 
+            // Check if redirection failed
             if(inputFd == -1) {
                 close(inputFd);
-                return 1;
+                proc->status = 1;
+                proc->exited = 1;
+                return proc;
             }
         }
 
@@ -333,60 +349,84 @@ int executeCommand(struct command *curr)
         if (curr->output != NULL) {
             int outputFd = redirectOutput(curr->output);
 
+            // Check if redirection failed
             if(outputFd == -1) {
                 close(outputFd);
-                return 1;
+                proc->status = 1;
+                proc->exited = 1;
+                return proc;
             }
         }
 
-        // Execute the command
+        // Redirect the input and output if background process
+        if (curr->ampersand == 1) {
+            // Check if the input is not specified
+            if(curr->input == NULL) {
+                int inputFd = redirectInput("/dev/null");
+
+                // Check if redirection failed
+                if(inputFd == -1) {
+                    close(inputFd);
+                    proc->status = 1;
+                    proc->exited = 1;
+                    return proc;
+                }
+            }
+
+            if(curr->output == NULL) {
+                // Check if the output is not specified
+                int outputFd = redirectOutput("/dev/null");
+
+                // Check if redirection failed
+                if(outputFd == -1) {
+                    close(outputFd);
+                    proc->status = 1;
+                    proc->exited = 1;
+                    return proc;
+                }
+            }
+        }
+
         execvp(curr->name, argv);
 
         // If execvp returns, there was an error
         perror("execvp failed");
-        exit(1);
+        fflush(stdout);
+        proc->status = 1;
+        proc->exited = 1;
+        return proc;
     } else {
         // Parent
-        // If foreground process
         if(curr->ampersand == 0) {
-            int status;
-            waitpid(spawnPid, &status, 0);
+            waitpid(spawnPid, &childStatus, 0);
 
-            if(WIFEXITED(status)) {
-                int exitStatus = WEXITSTATUS(status);
-                printf("exit value %d\n", exitStatus);
-            } else if (WIFSIGNALED(status)) {
-                int termSignal = WTERMSIG(status);
-                printf("terminated by signal %d\n", termSignal);
+            if(WIFEXITED(childStatus)) {
+                proc->status = WEXITSTATUS(childStatus);
+                proc->exited = 1;
+            } else {
+                proc->status = WTERMSIG(childStatus);
+                proc->exited = 0;
             }
         }
     }
-    return 0;
 }
 
 int main(int argc, char *argv[]) {
     char *userInput = NULL; // Stores the user input
-    int status = 0;
-    int builtInStatus = 0; // Stores the exit status of the last built in command
+    struct process *proc = NULL;
 
-    // Struct to store the last completed foreground process
-    struct process *lastProcess = NULL;
-
-    // Linked list to store current running processes
-    struct runningProcess *list = NULL;
-
+    // Set up signal handlers
     signal(SIGINT, handleSIGINT);
 
     // Set up for getline
     size_t len = 0;
     ssize_t read;
 
-    int started = 0;
-
     // Loop until the user enters "exit"
-    while (started == 0 || strcmp(userInput, "exit ") != 0) {
-        started = 1;
+    do {
+        free(userInput); // Free the user input
 
+        // Print the prompt and get the user input
         printf(": ");
         fflush(stdout);
         read = getline(&userInput, &len, stdin);
@@ -400,10 +440,10 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // If the user entered only whitespace, then continue
+        // If the user entered only whitespace, then jump to next iteration
         if (onlyWhiteSpace == 1) {
             continue;
-            // If they didn't, then process the input
+        // If they didn't, then process the input
         } else {
             // Replace the new line character with a space
             if (read > 0 && userInput[strlen(userInput) - 1] == '\n')
@@ -412,82 +452,37 @@ int main(int argc, char *argv[]) {
             // If the user entered a comment, then continue
             if (userInput[0] == '#') {
                 continue;
-                // If the user typed a command, then make the command struct
+            // If the user typed a command, then make the command struct
             } else {
-                // Save command as struct
-                struct command *currCommand = processLine(userInput);
-
-                // Uncomment this code to see the break down of the command
-                // if(currCommand != NULL) {
-                //     printf("Command: %s\n", currCommand->name);
-
-                //     if(currCommand->args != NULL) {
-                //         printf("Arguments: \n");
-                //         for(int i = 0; i < currCommand->numArgs; i++) {
-                //             printf(" Arg %d: %s\n", i+1, currCommand->args[i]);
-                //         }
-                //     }
-
-                //     if(currCommand->input != NULL) {
-                //         printf("Input: %s\n", currCommand->input);
-                //     }
-
-                //     if(currCommand->output != NULL) {
-                //         printf("Output: %s\n", currCommand->output);
-                //     }
-
-                //     printf("Ampersand: %d\n", currCommand->ampersand);
-                // }
-
-                if (currCommand != NULL) {
+                struct command *curr = processLine(userInput); // Save command in struct
+                
+                // If the command struct is valid, then execute it
+                if (curr != NULL) {
                     // Expand variables
                     int pid = getpid();
-                    struct command *expandCommand = expandVariables(currCommand, pid);
-
-                    // Uncomment this code to see the break down of the command
-                    // if(expandCommand != NULL) {
-                    //     printf("Command: %s\n", expandCommand->name);
-
-                    //     if(expandCommand->args != NULL) {
-                    //         printf("Arguments: \n");
-                    //         for(int i = 0; i < expandCommand->numArgs; i++) {
-                    //             printf(" Arg %d: %s\n", i+1, expandCommand->args[i]);
-                    //         }
-                    //     }
-
-                    //     if(expandCommand->input != NULL) {
-                    //         printf("Input: %s\n", expandCommand->input);
-                    //     }
-
-                    //     if(expandCommand->output != NULL) {
-                    //         printf("Output: %s\n", expandCommand->output);
-                    //     }
-
-                    //     printf("Ampersand: %d\n", expandCommand->ampersand);
-                    // }
+                    struct command *expand = expandVariables(curr, pid);
 
                     // If the user types CD, execute the built in for it
-                    if (strcmp(expandCommand->name, "cd") == 0) {
-                        builtInStatus = executeCD(expandCommand);
-                        // If the user types exit, execute the built in for it
+                    if (strcmp(expand->name, "cd") == 0) {
+                        executeCD(expand);
+                    // If the user types exit, execute the built in for it
                     }
-                    else if (strcmp(expandCommand->name, "exit") == 0) {
-                        executeExit(list);
-                        // If the user types status, execute the built in for it
+                    else if (strcmp(expand->name, "exit") == 0) {
+                        executeExit();
+                    // If the user types status, execute the built in for it
                     }
-                    else if (strcmp(expandCommand->name, "status") == 0) {
-                        builtInStatus = executeStatus(lastProcess);
-                        // Otherwise, execute the command
+                    else if (strcmp(expand->name, "status") == 0) {
+                        printStatus(proc);
+                    // Otherwise, execute the command
                     }
                     else {
-                        // Execute the command
-                        executeCommand(expandCommand);
-                        waitpid(pid);
+                        proc = executeCommand(expand);
                     }
                 }
             }
         }
-    }
+
+    } while (strcmp(userInput, "exit ") != 0);
 
     return 0;
 }
