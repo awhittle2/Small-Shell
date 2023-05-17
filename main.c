@@ -21,22 +21,8 @@ struct command {
     int ampersand; // 0 if no ampersand, 1 if ampersand
 };
 
-// Store the last running process in a struct
-struct process {
-    int pid;
-    struct command *currCommand;
-    char *exitStatus;
-    char *termSignal;
-};
-
-// Linked list of running processes
-struct runningProcess {
-    struct process *currProcess;
-    struct runningProcess *next;
-};
-
 void handleSIGINT(int sigum) {
-    // Do nothing
+    exit(EXIT_SUCCESS);
 }
 
 // Processes a line of user input and returns a command struct with the command name, arguments, input, output, and ampersand flag
@@ -94,6 +80,7 @@ struct command *processLine(char *currLine) {
         strcpy(currCommand->output, token);
     } else if (token != NULL && strcmp(token, "&") == 0) {
         currCommand->ampersand = 1; // Set the ampersand flag to true
+        return currCommand;         // Return the new command
     }
 
     token = strtok_r(NULL, " ", &saveptr);
@@ -111,6 +98,7 @@ struct command *processLine(char *currLine) {
         strcpy(currCommand->input, token);
     } else if (token != NULL && strcmp(token, "&") == 0) {
         currCommand->ampersand = 1; // Set the ampersand flag to true
+        return currCommand;         // Return the new command
     }
 
     token = strtok_r(NULL, " ", &saveptr);
@@ -161,7 +149,6 @@ char *variableExpansion(char *input, int expansions, int pid) {
     }
 
     newOutput[j] = '\0';
-
     return newOutput;
 }
 
@@ -214,35 +201,9 @@ struct command *expandVariables(struct command *currCommand, int pid) {
     return expandCommand;
 }
 
-// Function to kill all running processes
-void killAll(struct runningProcess *head) {
-    struct runningProcess *curr = head;
-    struct runningProcess *next = NULL;
-
-    while(curr != NULL) {
-        int pid = curr->currProcess->pid;
-        int result = kill(pid, SIGTERM);
-
-        if(result == -1) {
-            perror("Failed to kill process");
-            fflush(stdin);
-        } else {
-            printf("Killed process %d\n", head->currProcess->pid);
-            fflush(stdin);
-        }
-
-        next = curr->next;
-        free(curr->currProcess);
-        free(curr);
-
-        curr = next;
-    }
-}
-
 // Function to execute exit
-void executeExit(struct runningProcess *list){
-    // TO DO: Free memory
-    killAll(list);
+void executeExit(struct runningProcess *list) {
+    // killAll(list);
     exit(EXIT_SUCCESS);
 }
 
@@ -257,10 +218,10 @@ int executeCD(struct command *currCommand) {
         result = chdir(getenv("HOME"));
         if (result != 0) {
             perror("Failed to change directory");
-            fflush(stdin);
+            fflush(stdout);
             return 1;
         }
-        // If the user entered one argument, then go to that directory
+    // If the user entered one argument, then go to that directory
     } else {
         // If the user entered a relative path, then add the current directory
         if (currCommand->args[0][0] != '/') {
@@ -271,19 +232,19 @@ int executeCD(struct command *currCommand) {
                 result = chdir(currentDir);
                 if (result != 0) {
                     perror("Failed to change directory");
-                    fflush(stdin);
+                    fflush(stdout);
                     return 1;
                 }
             } else {
                 perror("Failed to get current directory");
-                fflush(stdin);
+                fflush(stdout);
                 return 1;
             }
         } else {
             result = chdir(currCommand->args[0]);
             if (result != 0) {
                 perror("Failed to change directory");
-                fflush(stdin);
+                fflush(stdout);
                 return 1;
             }
         }
@@ -293,28 +254,53 @@ int executeCD(struct command *currCommand) {
 }
 
 // Function to execute status
-int executeStatus(struct process *lastProcess) {
-    // If there is no previous process, then the exit status is 0
-    if(lastProcess == NULL) {
-        printf("exit value 0\n");
-        fflush(stdin);
-    } else {
-        // If there was an exit status, then print it
-        if(lastProcess->exitStatus != NULL) {
-            printf("exit value %s\n", lastProcess->exitStatus);
-            fflush(stdin);
-        // Else, print the termination signal
-        } else {
-            printf("terminated by signal %s\n", lastProcess->termSignal);
-            fflush(stdin);
-        }
-    }
+int executeStatus() {
 
     return 0;
 }
 
+// Function to redirect input
+int redirectInput(char *input) {
+    int fd = open(input, O_RDONLY);
+
+    if (fd == -1) {
+        perror("Failed to open file");
+        fflush(stdout);
+        return -1;
+    }
+
+    if (dup2(fd, 0) == -1) {
+        perror("Failed to redirect input");
+        fflush(stdout);
+        return -1;
+    }
+
+    return fd;
+}
+
+// Function to redirect output
+int redirectOutput(char *output)
+{
+    int fd = open(output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    if (fd == -1) {
+        perror("Failed to open file");
+        fflush(stdout);
+        return -1;
+    }
+
+    if (dup2(fd, 1) == -1) {
+        perror("Failed to redirect output");
+        fflush(stdout);
+        return -1;
+    }
+
+    return fd;
+}
+
 // Function to execute a command
-int executeCommand(struct command *curr) {
+int executeCommand(struct command *curr)
+{
     // Fork a new process
     int spawnPid = fork();
 
@@ -325,70 +311,63 @@ int executeCommand(struct command *curr) {
         return 1;
     } else if (spawnPid == 0) {
         // Child
-        printf("Child pid: %d\n", getpid());
-        fflush(stdin);
+        // Construct the argument array
+        char *argv[curr->numArgs + 2]; // +2 for command name and NULL terminator
+        argv[0] = curr->name;
+        for (int i = 0; i < curr->numArgs; i++) {
+            argv[i + 1] = curr->args[i];
+        }
+        argv[curr->numArgs + 1] = NULL;
+
+        // Redirect the input
+        if (curr->input != NULL) {
+            int inputFd = redirectInput(curr->input);
+
+            if(inputFd == -1) {
+                close(inputFd);
+                return 1;
+            }
+        }
+
+        // Redirect the output
+        if (curr->output != NULL) {
+            int outputFd = redirectOutput(curr->output);
+
+            if(outputFd == -1) {
+                close(outputFd);
+                return 1;
+            }
+        }
 
         // Execute the command
-        execvp(curr->name, curr->args);
+        execvp(curr->name, argv);
+
+        // If execvp returns, there was an error
+        perror("execvp failed");
+        exit(1);
     } else {
         // Parent
+        // If foreground process
+        if(curr->ampersand == 0) {
+            int status;
+            waitpid(spawnPid, &status, 0);
+
+            if(WIFEXITED(status)) {
+                int exitStatus = WEXITSTATUS(status);
+                printf("exit value %d\n", exitStatus);
+            } else if (WIFSIGNALED(status)) {
+                int termSignal = WTERMSIG(status);
+                printf("terminated by signal %d\n", termSignal);
+            }
+        }
     }
-    return 0;
-}
-
-// Function to redirect input
-int redirectInput(char *input) {
-    int fd = open(input, O_RDONLY);
-
-    if (fd == -1) {
-        perror("Failed to open file");
-        fflush(stdin);
-        return 1;
-    }
-
-    if (dup2(fd, 0) == -1) {
-        perror("Failed to redirect input");
-        fflush(stdin);
-        return 1;
-    }
-
-    if (close(fd) == -1) {
-        perror("Failed to close file");
-        fflush(stdin);
-        return 1;
-    }
-
-    return 0;
-}
-
-// Function to redirect output
-int redirectOutput(char *output) {
-    int fd = open(output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-    if (fd == -1) {
-        perror("Failed to open file");
-        fflush(stdin);
-        return 1;
-    }
-
-    if (dup2(fd, 1) == -1) {
-        perror("Failed to redirect output");
-        fflush(stdin);
-        return 1;
-    }
-
-    if (close(fd) == -1) {
-        perror("Failed to close file");
-        fflush(stdin);
-        return 1;
-    }
-
     return 0;
 }
 
 int main(int argc, char *argv[]) {
     char *userInput = NULL; // Stores the user input
-    int builtInStatus = 0;  // Stores the exit status of the last built in command
+    int status = 0;
+    int builtInStatus = 0; // Stores the exit status of the last built in command
 
     // Struct to store the last completed foreground process
     struct process *lastProcess = NULL;
@@ -408,9 +387,8 @@ int main(int argc, char *argv[]) {
     while (started == 0 || strcmp(userInput, "exit ") != 0) {
         started = 1;
 
-        // Prompt the user for input
         printf(": ");
-        fflush(stdin);
+        fflush(stdout);
         read = getline(&userInput, &len, stdin);
 
         // Check if the user entered only whitespace
@@ -492,39 +470,20 @@ int main(int argc, char *argv[]) {
                     if (strcmp(expandCommand->name, "cd") == 0) {
                         builtInStatus = executeCD(expandCommand);
                         // If the user types exit, execute the built in for it
-                    } else if (strcmp(expandCommand->name, "exit") == 0) {
+                    }
+                    else if (strcmp(expandCommand->name, "exit") == 0) {
                         executeExit(list);
                         // If the user types status, execute the built in for it
-                    } else if (strcmp(expandCommand->name, "status") == 0) {
+                    }
+                    else if (strcmp(expandCommand->name, "status") == 0) {
                         builtInStatus = executeStatus(lastProcess);
                         // Otherwise, execute the command
-                    } else {
+                    }
+                    else {
+                        // Execute the command
                         executeCommand(expandCommand);
+                        waitpid(pid);
                     }
-
-                    // if(expandCommand != NULL) {
-                    //     // free(expandCommand->name);
-                    //     // // Free args
-                    //     // if(expandCommand->input != NULL) {
-                    //     //     free(expandCommand->input);
-                    //     // }
-                    //     // if(expandCommand->output != NULL) {
-                    //     //     free(expandCommand->output);
-                    //     // }
-                    //     free(expandCommand);
-                    // }
-                }
-
-                if(currCommand != NULL) {
-                    free(currCommand->name);
-                    // Free args
-                    if(currCommand->input != NULL) {
-                        free(currCommand->input);
-                    }
-                    if(currCommand->output != NULL) {
-                        free(currCommand->output);
-                    }
-                    free(currCommand);
                 }
             }
         }
