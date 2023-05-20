@@ -1,13 +1,12 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <ctype.h>
-#include <signal.h>
-#include <sys/wait.h>
+#include <stdio.h> // For printf, getline, perror, and fflush
+#include <stdlib.h> // For malloc and free
+#include <string.h> // For strtok_r
+#include <unistd.h> // For fork, execvp, and chdir
+#include <fcntl.h> // For open
+#include <ctype.h> // For isspace
+#include <signal.h> // For signal handling
+#include <sys/wait.h> // For parent pid waiting
+#include <errno.h> // For process checking
 
 // Store the command in a struct
 struct command {
@@ -21,12 +20,68 @@ struct command {
 
 // Store the latest process in a struct
 struct process {
+    pid_t pid;
     int status;
+    int exitStatus;
     int exited;
 };
 
+// Store the latest process in a struct
+struct process2 {
+    pid_t pid;
+    int exitStatus;
+    int exited;
+    struct process2 *next;
+};
+
+struct background {
+    struct process *proc;
+    struct background *prev;
+    struct background *next;
+};
+
+struct process2 *terminated = NULL;
+int foregroundOnly = 0;
+int notForegroundOnly = 0;
+int activated = 0;
+int inProcess = 0;
 void handleSIGINT(int sigum) {
-    exit(EXIT_SUCCESS);
+    if(inProcess == 1) {
+        char *message = "terminated by signal 2\n";
+        write(STDOUT_FILENO, message, 24);
+        fflush(stdout);
+    }
+}
+
+void stopHandleSig(int sig) {
+    if(activated == 0) {
+        foregroundOnly = 1;
+        activated = 1;
+    } else {
+        notForegroundOnly = 1;
+        activated = 0;
+    }
+}
+
+void childHandleSig(int sig) {
+    pid_t pid;
+    int status;
+
+    while((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        struct process2 *new = malloc(sizeof(struct process));
+        new->pid = pid;
+ 
+        if(WIFEXITED(status)) {
+            new->exitStatus = WEXITSTATUS(status);
+            new->exited = 1;
+        } else {
+            new->exitStatus = WTERMSIG(status);
+            new->exited = 0;
+        }
+
+        new->next = terminated;
+        terminated = new;
+    }
 }
 
 // Processes a line of user input and returns a command struct with the command name, arguments, input, output, and ampersand flag
@@ -197,11 +252,6 @@ struct command *expandVariables(struct command *curr, int pid) {
     return expand;
 }
 
-// Function to execute exit
-void executeExit() {
-    exit(EXIT_SUCCESS);
-}
-
 // Function to execute CD
 void executeCD(struct command *curr) {
     int result = 0;
@@ -291,22 +341,23 @@ int redirectOutput(char *output) {
     return fd;
 }
 
-// Function to set status
-void printStatus(struct process *proc) {
-    if(proc == NULL) {
-        printf("exit value 0\n");
-        return;
-    }
-
-    if(proc->exited == 1) {
-        printf("exit value %d\n", proc->status);
-    } else {
-        printf("terminated by signal %d\n", proc->status);
+void killChild(pid_t pid) {
+    int status;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) && !WIFSIGNALED(status)) {
+        kill(pid, SIGKILL);
     }
 }
 
+
 // Function to execute a command
 struct process *executeCommand(struct command *curr) {
+    if(curr->ampersand == 1) {
+        signal(SIGINT, SIG_IGN);
+    } else {
+        signal(SIGINT, handleSIGINT);
+    }
+    
     // Fork a new process
     int childStatus;
     pid_t spawnPid = fork();
@@ -315,14 +366,16 @@ struct process *executeCommand(struct command *curr) {
 
     // If the fork failed, then print an error
     if (spawnPid == -1) {
+        inProcess = 0;
         perror("Failed to fork");
         fflush(stdin);
-        proc->status = 1;
+        proc->exitStatus = 1;
         proc->exited = 1;
-        return proc;
+        exit(1);
     } else if (spawnPid == 0) {
         // Child
         // Construct the argument array
+        inProcess = 1;
         char *argv[curr->numArgs + 2];
         argv[0] = curr->name;
 
@@ -339,9 +392,9 @@ struct process *executeCommand(struct command *curr) {
             // Check if redirection failed
             if(inputFd == -1) {
                 close(inputFd);
-                proc->status = 1;
+                proc->exitStatus = 1;
                 proc->exited = 1;
-                return proc;
+                exit(1);
             }
         }
 
@@ -352,9 +405,9 @@ struct process *executeCommand(struct command *curr) {
             // Check if redirection failed
             if(outputFd == -1) {
                 close(outputFd);
-                proc->status = 1;
+                proc->exitStatus = 1;
                 proc->exited = 1;
-                return proc;
+                exit(1);
             }
         }
 
@@ -367,9 +420,9 @@ struct process *executeCommand(struct command *curr) {
                 // Check if redirection failed
                 if(inputFd == -1) {
                     close(inputFd);
-                    proc->status = 1;
+                    proc->exitStatus = 1;
                     proc->exited = 1;
-                    return proc;
+                    exit(1);
                 }
             }
 
@@ -380,9 +433,9 @@ struct process *executeCommand(struct command *curr) {
                 // Check if redirection failed
                 if(outputFd == -1) {
                     close(outputFd);
-                    proc->status = 1;
+                    proc->exitStatus = 1;
                     proc->exited = 1;
-                    return proc;
+                    exit(1);
                 }
             }
         }
@@ -392,31 +445,184 @@ struct process *executeCommand(struct command *curr) {
         // If execvp returns, there was an error
         perror("execvp failed");
         fflush(stdout);
-        proc->status = 1;
+        proc->exitStatus = 1;
         proc->exited = 1;
-        return proc;
+        inProcess = 0;
+        exit(1);
     } else {
         // Parent
-        if(curr->ampersand == 0) {
-            waitpid(spawnPid, &childStatus, 0);
+        inProcess = 0;
+        proc->pid = spawnPid;
+        proc->status = childStatus;
+
+        if(curr->ampersand == 0 || activated == 1) {
+            waitpid(spawnPid, &childStatus, 0);          
 
             if(WIFEXITED(childStatus)) {
-                proc->status = WEXITSTATUS(childStatus);
+                proc->exitStatus = WEXITSTATUS(childStatus);
+                if(proc->exitStatus != 0) {
+                    killChild(spawnPid);
+                }
                 proc->exited = 1;
             } else {
-                proc->status = WTERMSIG(childStatus);
+                proc->exitStatus = WTERMSIG(childStatus);
                 proc->exited = 0;
             }
+            return proc;
+        } else {
+            printf("background pid is %d\n", spawnPid);
+            fflush(stdout);
+            waitpid(spawnPid, &childStatus, WNOHANG);         
+
+            return proc;
         }
     }
 }
 
+void buildList(struct background **list, struct process *proc) {
+    if(*list == NULL) {
+        (*list) = malloc(sizeof(struct background));
+        (*list)->proc = malloc(sizeof(struct process));
+        (*list)->proc = proc;
+        (*list)->prev = NULL;
+        (*list)->next = NULL;
+    } else {
+        struct background *curr = *list;
+        while(curr->next != NULL) {
+            curr = curr->next;
+        }
+
+        struct background *new = malloc(sizeof(struct background));
+        new->proc = proc;
+        new->prev = curr;
+        new->next = NULL;
+        curr->next = new;
+    }
+}
+
+void freeCommand(struct command *curr) {
+    if(curr != NULL) {
+        free(curr->name);
+        if(curr->args != NULL) {
+            for(int i = 0; i < curr->numArgs; i++) {
+                free(curr->args[i]);
+            }
+            free(curr->args);
+        }
+        if(curr->input != NULL) {
+            free(curr->input);
+        }
+        if(curr->output != NULL) {
+            free(curr->output);
+        }
+        free(curr);
+    }
+}
+
+void freeProcess(struct process *curr) {
+    if(curr != NULL) {
+        free(curr);
+    }
+}
+
+void freeProcess2(struct process2 *curr) {
+    if(curr != NULL) {
+        struct process2 *temp;
+        while(curr != NULL) {
+            temp = curr;
+            curr = curr->next;
+            free(temp);
+        }
+    }
+}
+
+void freeBackgroundList(struct background *list) {
+    if(list != NULL) {
+        struct background *temp;
+        while(list != NULL) {
+            temp = list;
+            list = list->next;
+            freeProcess(temp->proc);
+            free(temp);
+        }
+    }
+}
+
+void killChildren(struct background *list) {
+    struct background *curr = list;
+
+    while(curr != NULL) {
+        kill(curr->proc->pid, SIGTERM);
+        curr = curr->next;
+    }
+}
+
+// Function to execute exit
+void executeExit(struct background *list) {
+    killChildren(list);
+    freeBackgroundList(list);
+    exit(EXIT_SUCCESS);
+}
+
+// This function remove process that have exited or been terminated
+void removeProcesses(struct background **list) {
+    struct background *curr = *list;
+    struct process2 *curr2 = NULL;
+    struct process2 *currT = NULL;
+
+    currT = terminated;
+    terminated = NULL;
+    //freeProcess2(terminated);
+
+    while(curr != NULL) {
+        curr2 = currT;
+        while(curr2 != NULL) {
+            if(curr->proc->pid == curr2->pid) {
+                if(curr->prev == NULL) {
+                    if(curr->next == NULL) {
+                        (*list) = NULL;
+                    } else {
+                        curr->next->prev = NULL;
+                        (*list) = curr->next;
+                    }
+                } else {
+                    if(curr->next == NULL) {
+                        curr->prev->next = NULL;
+                    } else {
+                        curr->prev->next = curr->next;
+                        curr->next->prev = curr->prev;
+                    }
+                }
+
+                if(curr2->exited == 1) {
+                    printf("background pid %d is done: exit value %d\n", curr2->pid, curr2->exitStatus);
+                    fflush(stdout);
+                } else {
+                    printf("background pid %d is done: terminated by signal %d\n", curr2->pid, curr2->exitStatus);
+                    fflush(stdout);
+                }
+            }
+
+            curr2 = curr2->next;
+        }
+        curr = curr->next;
+    }
+
+    // freeProcess2(currT);
+    // freeProcess2(curr2);
+    // freeBackgroundList(curr);
+}
+
 int main(int argc, char *argv[]) {
     char *userInput = NULL; // Stores the user input
-    struct process *proc = NULL;
+    struct process *currProc = malloc(sizeof(struct process));
+    struct process *bgProc = malloc(sizeof(struct process));
+    struct background *list = NULL;
 
     // Set up signal handlers
-    signal(SIGINT, handleSIGINT);
+    signal(SIGINT, SIG_IGN);
+    signal(SIGTSTP, stopHandleSig);
+    signal(SIGCHLD, childHandleSig);
 
     // Set up for getline
     size_t len = 0;
@@ -424,7 +630,18 @@ int main(int argc, char *argv[]) {
 
     // Loop until the user enters "exit"
     do {
-        free(userInput); // Free the user input
+
+        removeProcesses(&list);
+
+        if(foregroundOnly == 1) {
+            printf("Entering foreground-only mode (& is now ignored)\n");
+            fflush(stdout);
+            foregroundOnly = 0;
+        } else if(notForegroundOnly == 1) {
+            printf("Exiting foreground-only mode\n");
+            fflush(stdout);
+            notForegroundOnly = 0;
+        }
 
         // Print the prompt and get the user input
         printf(": ");
@@ -468,21 +685,48 @@ int main(int argc, char *argv[]) {
                     // If the user types exit, execute the built in for it
                     }
                     else if (strcmp(expand->name, "exit") == 0) {
-                        executeExit();
+                        freeCommand(expand);
+                        free(userInput);
+                        freeProcess(currProc);
+                        freeProcess(bgProc);
+                        // Need to impliment function to kill all children
+                        //freeBackgroundList(list);
+                        executeExit(list);
                     // If the user types status, execute the built in for it
                     }
                     else if (strcmp(expand->name, "status") == 0) {
-                        printStatus(proc);
+                       if(currProc == NULL) {
+                        printf("exit value 0\n");
+                       } else {
+                            if(currProc->exited == 1) {
+                                printf("exit value %d\n", currProc->exitStatus);
+                            } else {
+                                printf("terminated by signal %d\n", currProc->exitStatus);
+                            }
+                       }
                     // Otherwise, execute the command
                     }
                     else {
-                        proc = executeCommand(expand);
+                        if(expand->ampersand == 0) {
+                            currProc = executeCommand(expand);
+                        } else {
+                            bgProc = executeCommand(expand);
+                            buildList(&list, bgProc);
+                        }
                     }
+
+                    freeCommand(expand);
+                    //free(userInput);
                 }
             }
         }
 
     } while (strcmp(userInput, "exit ") != 0);
+
+    free(userInput);
+    freeProcess(currProc);
+    freeProcess(bgProc);
+    freeBackgroundList(list);
 
     return 0;
 }
